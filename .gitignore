@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+gpu_monitor_config.json
+crash.log
+autostart.log
+_preview_*.png
+*.tmp
