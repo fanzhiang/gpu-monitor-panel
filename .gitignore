@@ -3,5 +3,6 @@ __pycache__/
 gpu_monitor_config.json
 crash.log
 autostart.log
+_autostart_reg.cmd
 _preview_*.png
 *.tmp

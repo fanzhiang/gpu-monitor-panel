@@ -37,12 +37,19 @@ from tkinter import ttk, messagebox
 # ---------------------------------------------------------------- 常量 / 路径
 
 APP_NAME = "GPU 监视器"
+APP_VERSION = "1.1.0"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "gpu_monitor_config.json")
 ICON_PATH = os.path.join(BASE_DIR, "_gpu_tray.ico")
 
 FONT = "Microsoft YaHei UI"
 MONO = "Consolas"
+
+# 窗口尺寸：无边框窗口无法由系统缩放，全部靠右下角抓手手动改
+DEFAULT_W, DEFAULT_H = 356, 500        # 主面板默认尺寸
+MIN_W, MIN_H = 300, 340                # 主面板最小尺寸
+ADV_DEFAULT_W, ADV_DEFAULT_H = 460, 640  # 模型顾问默认尺寸
+ADV_MIN_W, ADV_MIN_H = 420, 380          # 模型顾问最小尺寸
 
 # 关键系统进程：禁止结束（小写名）
 PROTECTED_NAMES = {
@@ -942,7 +949,7 @@ class Spark(tk.Canvas):
 
 
 class GPUPanel(tk.Tk):
-    W, H = 336, 470
+    W, H = DEFAULT_W, DEFAULT_H
 
     def __init__(self):
         super().__init__()
@@ -951,6 +958,12 @@ class GPUPanel(tk.Tk):
         self.overrideredirect(True)
 
         self.cfg = self.load_cfg()
+        # 窗口尺寸记忆（右下角可拖动缩放）
+        self.W = max(MIN_W, int(self.cfg.get("w", DEFAULT_W)))
+        self.H = max(MIN_H, int(self.cfg.get("h", DEFAULT_H)))
+        self.adv_w = max(ADV_MIN_W, int(self.cfg.get("adv_w", ADV_DEFAULT_W)))
+        self.adv_h = max(ADV_MIN_H, int(self.cfg.get("adv_h", ADV_DEFAULT_H)))
+
         # 上次的置顶/透明度/刷新率设置要在启动时就生效（之前只存不用）
         self.attributes("-topmost", bool(self.cfg.get("topmost", True)))
         self.alpha = float(self.cfg.get("alpha", 0.96))
@@ -967,7 +980,15 @@ class GPUPanel(tk.Tk):
         self.proc_rows: Dict[str, GpuProc] = {}
 
         self._build()
+        # 高 DPI 下按钮的像素需求变大：按实际请求宽度推算最小宽度，
+        # 否则窄窗口里"结束进程 / 模型顾问"会被裁掉
+        need = (self.btn_llm.winfo_reqwidth() + self.btn_kill.winfo_reqwidth()
+                + self.btn_settings.winfo_reqwidth()
+                + self.btn_advisor.winfo_reqwidth() + 24)
+        self._min_w = max(MIN_W, need)
+        self.W = max(self.W, self._min_w)
         self._place_initial()
+        self.bind("<Configure>", self._on_main_configure)
         self._setup_tray()
         self._start_hotkey()
 
@@ -994,7 +1015,9 @@ class GPUPanel(tk.Tk):
     # ------------------------------------------------------------ 配置
 
     def load_cfg(self) -> dict:
-        d = {"x": None, "y": None, "alpha": 0.96, "interval": 1500, "topmost": True}
+        d = {"x": None, "y": None, "alpha": 0.96, "interval": 1500, "topmost": True,
+             "w": DEFAULT_W, "h": DEFAULT_H,
+             "adv_w": ADV_DEFAULT_W, "adv_h": ADV_DEFAULT_H}
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 d.update(json.load(f))
@@ -1004,12 +1027,23 @@ class GPUPanel(tk.Tk):
 
     def save_cfg(self):
         try:
+            # 悬浮球/隐藏状态下 winfo 尺寸不是面板尺寸，不能覆盖记忆值
+            if not self.mini and self.winfo_width() > 100:
+                self.W, self.H = self.winfo_width(), self.winfo_height()
+            try:
+                aw, ah = self.advisor_win.winfo_width(), self.advisor_win.winfo_height()
+                if aw > 100 and ah > 100:
+                    self.adv_w, self.adv_h = aw, ah
+            except Exception:
+                pass
             self.cfg.update({"x": self.winfo_x(), "y": self.winfo_y(),
                              "alpha": self.alpha,
                              # 隐藏到托盘时 collector.interval 被临时降到 5s，
                              # 不能把它当作用户设置写回配置
                              "interval": int(self.cfg.get("interval", 1500)),
-                             "topmost": bool(self.attributes("-topmost"))})
+                             "topmost": bool(self.attributes("-topmost")),
+                             "w": int(self.W), "h": int(self.H),
+                             "adv_w": int(self.adv_w), "adv_h": int(self.adv_h)})
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(self.cfg, f)
         except Exception:
@@ -1042,7 +1076,8 @@ class GPUPanel(tk.Tk):
 
         for txt, cmd, col in (("✕", self.quit_app, C_RED),
                               ("—", self.toggle_hide, C_SUB),
-                              ("◎", self.toggle_mini, C_SUB)):
+                              ("◎", self.toggle_mini, C_SUB),
+                              ("↻", self.force_refresh, C_SUB)):
             b = tk.Label(self.bar, text=txt, bg=C_CARD, fg=col,
                          font=(FONT, 10), cursor="hand2", width=2)
             b.pack(side="right")
@@ -1080,7 +1115,22 @@ class GPUPanel(tk.Tk):
 
         wrap = tk.Frame(self.body, bg=C_BORDER)
         btns = tk.Frame(self.body, bg=C_BG)
-        btns.pack(side="bottom", fill="x", pady=(8, 9))  # 先占住底部，防止被表格挤出窗口
+
+        # 底部状态条（含缩放抓手）：必须最先 pack 到底部，才会贴在窗口最下沿
+        self.statusbar = tk.Frame(self.body, bg=C_CARD, height=18)
+        self.statusbar.pack(side="bottom", fill="x", pady=(6, 0))
+        self.statusbar.pack_propagate(False)
+        self.lbl_status = tk.Label(self.statusbar, text="就绪", bg=C_CARD, fg=C_SUB,
+                                   font=(FONT, 7), anchor="w")
+        self.lbl_status.pack(side="left", padx=(6, 0))
+        self.grip = tk.Label(self.statusbar, text="◢", bg=C_CARD, fg="#5c6370",
+                             font=(FONT, 8), cursor="size_nw_se")
+        self.grip.pack(side="right", padx=(0, 3))
+        self.grip.bind("<ButtonPress-1>", self._resize_start)
+        self.grip.bind("<B1-Motion>", self._resize_move)
+        self.grip.bind("<Double-Button-1>", lambda e: self._reset_size())
+
+        btns.pack(side="bottom", fill="x", pady=(8, 6))  # 先占住底部，防止被表格挤出窗口
         wrap.pack(fill="both", expand=True)
         inner = tk.Frame(wrap, bg=C_CARD)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
@@ -1093,13 +1143,19 @@ class GPUPanel(tk.Tk):
                      borderwidth=0, font=(FONT, 8))
         st.map("T.Treeview", background=[("selected", "#2d4a7a")],
                foreground=[("selected", "#ffffff")])
+        # 滚动条跟随深色主题（clam 默认箭头是白底黑三角，很突兀）
+        st.configure("TScrollbar", background=C_CARD2, troughcolor=C_BG,
+                     bordercolor=C_BORDER, arrowcolor=C_SUB,
+                     lightcolor=C_CARD2, darkcolor=C_CARD2, relief="flat")
+        st.map("TScrollbar", background=[("active", C_BORDER)],
+               arrowcolor=[("active", C_FG)])
 
         self.tree = ttk.Treeview(inner, style="T.Treeview", show="headings",
                                  columns=("name", "pid", "mem", "util"), height=7)
-        self.tree.heading("name", text="进程")
-        self.tree.heading("pid", text="PID")
-        self.tree.heading("mem", text="显存")
-        self.tree.heading("util", text="GPU")
+        # 表头点击排序（显存默认降序：最占显存的排最前）
+        self.sort_col = "mem"
+        self.sort_desc = True
+        self._update_headings()
         self.tree.column("name", width=132, anchor="w")
         self.tree.column("pid", width=52, anchor="center")
         self.tree.column("mem", width=64, anchor="e")
@@ -1115,29 +1171,32 @@ class GPUPanel(tk.Tk):
 
         # 底部按钮
         self.btn_llm = tk.Button(
-            btns, text="🚀 大模型模式", command=self.llm_mode,
+            btns, text="🚀 大模型", command=self.llm_mode,
             bg="#22303a", fg="#7fe3a0", activebackground="#2a3c48",
             activeforeground="#b0f0c8", relief="flat", bd=0,
             font=(FONT, 9, "bold"), cursor="hand2", height=1, pady=5)
-        self.btn_llm.pack(side="left", padx=(0, 5))
         self.btn_kill = tk.Button(
-            btns, text="结束选中进程", command=self.kill_selected,
+            btns, text="结束进程", command=self.kill_selected,
             bg="#3a2226", fg="#ff9a92", activebackground="#4a2a2f",
             activeforeground="#ffd0cc", relief="flat", bd=0,
             font=(FONT, 9, "bold"), cursor="hand2", height=1, pady=5)
-        self.btn_kill.pack(side="left", fill="x", expand=True)
-        
-        # 模型顾问按钮 (右侧)
-        self.btn_advisor = tk.Button(btns, text="📊 模型顾问", command=self.show_advisor, width=8,
-                  bg=C_CARD, fg="#6fb1d9", activebackground="#2a3a4a",
-                  activeforeground="#a0d4f0", relief="flat", bd=0,
-                  font=(FONT, 9), cursor="hand2")
-        self.btn_advisor.pack(side="right", padx=(0, 5))
+        self.btn_advisor = tk.Button(
+            btns, text="📊 模型顾问", command=self.show_advisor,
+            bg=C_CARD, fg="#6fb1d9", activebackground="#2a3a4a",
+            activeforeground="#a0d4f0", relief="flat", bd=0,
+            font=(FONT, 9), cursor="hand2", padx=6)
+        self.btn_settings = tk.Button(
+            btns, text="设置", command=self.show_settings,
+            bg=C_CARD, fg=C_SUB, activebackground=C_CARD2,
+            activeforeground=C_FG, relief="flat", bd=0,
+            font=(FONT, 9), cursor="hand2", padx=6)
 
-        tk.Button(btns, text="设置", command=self.show_settings, width=6,
-                  bg=C_CARD, fg=C_SUB, activebackground=C_CARD2,
-                  activeforeground=C_FG, relief="flat", bd=0,
-                  font=(FONT, 9), cursor="hand2").pack(side="right")
+        # 先 pack 右侧固定按钮：中间带 expand 的按钮若先 pack，会先吃掉整行空间，
+        # 把右侧按钮挤出窗口（旧版窄窗口下按钮被裁掉就是这个原因）
+        self.btn_advisor.pack(side="right", padx=(0, 5))
+        self.btn_settings.pack(side="right")
+        self.btn_llm.pack(side="left", padx=(0, 5))
+        self.btn_kill.pack(side="left", fill="x", expand=True)
 
         # ── 模型顾问面板 (初始隐藏) ────────────────────────────────
         self.advisor_win = tk.Toplevel(self)
@@ -1149,6 +1208,9 @@ class GPUPanel(tk.Tk):
         self.advisor_device = "local"  # 当前推荐目标设备
         self._advisor_key = None       # 已渲染的设备 key（命中则秒开）
         self._adv_saved_geo = None     # 最大化前尺寸
+        self._adv_feasible_only = False  # 只看能跑（隐藏装不下的）
+        self._adv_rows = []            # 当前表格数据（供复制）
+        self._adv_min_w = ADV_MIN_W    # 按内容算出的最小宽度（渲染后更新）
 
         # 标题栏（绑定拖动）
         a_head = tk.Frame(self.advisor_win, bg=C_CARD, height=36)
@@ -1180,14 +1242,21 @@ class GPUPanel(tk.Tk):
         self.a_canvas.configure(yscrollcommand=a_sb.set)
         self.a_frame = tk.Frame(self.a_canvas, bg=C_BG)
 
-        self.a_canvas.create_window((0, 0), window=self.a_frame, anchor="nw")
+        self._a_win = self.a_canvas.create_window((0, 0), window=self.a_frame, anchor="nw")
         self.a_canvas.pack(side="left", fill="both", expand=True)
         a_sb.pack(side="right", fill="y")
 
-        # 绑定滚动事件：canvas 尺寸变化和内容高度变化都要刷新 scrollregion，
-        # 否则切换设备重渲染后滚动范围是旧的
-        self.a_canvas.bind("<Configure>", lambda e: self.a_canvas.configure(scrollregion=self.a_canvas.bbox("all")))
-        self.a_frame.bind("<Configure>", lambda e: self.a_canvas.configure(scrollregion=self.a_canvas.bbox("all")))
+        # 内容宽度必须跟随画布：否则窗口拉大只会多出右侧空白，表格不会变宽
+        def _on_canvas_cfg(e):
+            try:
+                self.a_canvas.itemconfigure(self._a_win, width=e.width)
+            except Exception:
+                pass
+            self.a_canvas.configure(scrollregion=self.a_canvas.bbox("all"))
+
+        self.a_canvas.bind("<Configure>", _on_canvas_cfg)
+        self.a_frame.bind("<Configure>",
+                          lambda e: self.a_canvas.configure(scrollregion=self.a_canvas.bbox("all")))
         # 滚轮绑在 Toplevel 上：Toplevel 在所有子控件的 bindtags 里，悬停任意子组件都能滚动
         self.advisor_win.bind("<MouseWheel>",
                               lambda e: self.a_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
@@ -1196,11 +1265,24 @@ class GPUPanel(tk.Tk):
         a_status = tk.Frame(self.advisor_win, bg=C_CARD, height=16)
         a_status.pack(fill="x", side="bottom")
         a_status.pack_propagate(False)
-        grip = tk.Label(a_status, text="◢", fg="#5c6370", bg=C_CARD,
-                        font=(FONT, 8), cursor="size_nw_se")
-        grip.pack(side="right", padx=3)
-        grip.bind("<ButtonPress-1>", self._adv_resize_start)
-        grip.bind("<B1-Motion>", self._adv_resize_move)
+        self.adv_grip = tk.Label(a_status, text="◢", fg="#6b7380", bg=C_CARD,
+                                 font=(FONT, 9), cursor="size_nw_se", width=2)
+        self.adv_grip.pack(side="right", padx=(0, 2))
+        self.adv_grip.bind("<ButtonPress-1>", self._adv_resize_start)
+        self.adv_grip.bind("<B1-Motion>", self._adv_resize_move)
+        self.adv_grip.bind("<Double-Button-1>", lambda e: self._adv_reset_size())
+
+        # 右边缘 / 下边缘细拖动带（5px）：不用精准点中小抓手也能拉
+        for kw, cur in (
+                (dict(relx=1.0, rely=0.0, anchor="ne", relheight=1.0, width=5),
+                 "sb_h_double_arrow"),
+                (dict(relx=0.0, rely=1.0, anchor="sw", relwidth=1.0, height=5),
+                 "sb_v_double_arrow")):
+            band = tk.Frame(self.advisor_win, bg=C_BG, cursor=cur,
+                            bd=0, highlightthickness=0)
+            band.place(**kw)
+            band.bind("<ButtonPress-1>", self._adv_resize_start)
+            band.bind("<B1-Motion>", self._adv_resize_move)
 
         # 悬浮球（初始隐藏）
         self.ball = tk.Frame(self, bg=C_CARD, width=112, height=40)
@@ -1265,20 +1347,95 @@ class GPUPanel(tk.Tk):
         except Exception:
             pass
 
+    # ---- 主面板缩放（无边框窗口只能手动实现） ----
+
+    def _on_main_configure(self, e):
+        """任何来源的尺寸变化都同步到记忆值（拖动 / 程序设置 / DPI 变化）。"""
+        if e.widget is not self or self.mini:
+            return
+        if e.width > 100 and e.height > 100:
+            self.W, self.H = e.width, e.height
+
+    def _resize_start(self, e):
+        # 记录拖动起点的绝对指针坐标：抓手本身会随窗口移动，
+        # 用 e.x / e.y（相对控件）会越拖越偏，甚至完全拖不动。
+        self._rs = (self.winfo_width(), self.winfo_height(),
+                    self.winfo_pointerx(), self.winfo_pointery())
+
+    def _resize_move(self, e):
+        if not getattr(self, "_rs", None):
+            return
+        w0, h0, px0, py0 = self._rs
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = max(getattr(self, "_min_w", MIN_W),
+                min(sw, w0 + (self.winfo_pointerx() - px0)))
+        h = max(MIN_H, min(sh, h0 + (self.winfo_pointery() - py0)))
+        self.W, self.H = int(w), int(h)
+        try:
+            self.geometry("%dx%d" % (self.W, self.H))
+        except Exception:
+            pass
+
+    def _reset_size(self):
+        """双击抓手恢复默认尺寸。"""
+        self.W = max(DEFAULT_W, getattr(self, "_min_w", DEFAULT_W))
+        self.H = DEFAULT_H
+        self.geometry("%dx%d" % (self.W, self.H))
+
+    # ---- 进程表排序 ----
+
+    def _update_headings(self):
+        base = {"name": "进程", "pid": "PID", "mem": "显存", "util": "GPU"}
+        for c, label in base.items():
+            if c == self.sort_col:
+                label += " ▼" if self.sort_desc else " ▲"
+            self.tree.heading(c, text=label,
+                              command=lambda cc=c: self._sort_by(cc))
+
+    def _sort_by(self, col: str):
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col = col
+            self.sort_desc = (col != "name")   # 名字升序，数值降序
+        self._update_headings()
+        if self.snap:
+            self._render(self.snap)
+
+    def _sorted_procs(self, procs: List[GpuProc]) -> List[GpuProc]:
+        key = {"name": lambda p: p.name.lower(), "pid": lambda p: p.pid,
+               "mem": lambda p: p.mem_mb, "util": lambda p: p.util}.get(self.sort_col)
+        if key is None:
+            return procs
+        return sorted(procs, key=key, reverse=self.sort_desc)
+
+    # ---- 模型顾问缩放 ----
+
     def _adv_resize_start(self, e):
-        self._rs = (self.advisor_win.winfo_width(),
-                    self.advisor_win.winfo_height(), e.x, e.y)
+        self._rs = (self.advisor_win.winfo_width(), self.advisor_win.winfo_height(),
+                    self.winfo_pointerx(), self.winfo_pointery())
 
     def _adv_resize_move(self, e):
         if not getattr(self, "_rs", None):
             return
-        w0, h0, x0, y0 = self._rs
-        w = max(360, w0 + (e.x - x0))
-        h = max(420, h0 + (e.y - y0))
+        w0, h0, px0, py0 = self._rs
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w = max(getattr(self, "_adv_min_w", ADV_MIN_W),
+                min(sw, w0 + (self.winfo_pointerx() - px0)))
+        h = max(ADV_MIN_H, min(sh, h0 + (self.winfo_pointery() - py0)))
+        self.adv_w, self.adv_h = int(w), int(h)
+        # 手动缩放后取消"最大化"还原点，避免还原时尺寸错乱
+        self._adv_saved_geo = None
         try:
-            self.advisor_win.geometry("%dx%d" % (w, h))
+            self.advisor_win.geometry("%dx%d" % (self.adv_w, self.adv_h))
         except Exception:
             pass
+
+    def _adv_reset_size(self):
+        """双击抓手恢复模型顾问默认尺寸。"""
+        self.adv_w, self.adv_h = ADV_DEFAULT_W, ADV_DEFAULT_H
+        self._adv_saved_geo = None
+        self.advisor_win.geometry("%dx%d" % (self.adv_w, self.adv_h))
 
     def toggle_mini(self):
         """切换 悬浮球 <-> 完整面板。"""
@@ -1404,15 +1561,18 @@ class GPUPanel(tk.Tk):
             self._render_advisor()
             self._advisor_key = self.advisor_device
         # 定位在主面板右侧（钳制在屏幕内）
-        ax = min(self.winfo_x() + self.winfo_width() + 10,
-                 self.winfo_screenwidth() - 430)
-        ay = max(0, min(self.winfo_y(), self.winfo_screenheight() - 100))
-        if self.advisor_win.winfo_width() <= 50:
-            self.advisor_win.geometry(f"420x560+{ax}+{ay}")
-        else:
-            w = self.advisor_win.winfo_width()
-            h = self.advisor_win.winfo_height()
-            self.advisor_win.geometry(f"{w}x{h}+{ax}+{ay}")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        # 以记录值为准：未映射窗口的 winfo_width 返回的是"内容自然宽度"，
+        # 直接拿来用会把首次打开的尺寸带偏
+        w, h = self.adv_w, self.adv_h
+        w = max(getattr(self, "_adv_min_w", ADV_MIN_W), w)
+        w = max(ADV_MIN_W, min(sw - 20, w))
+        h = max(ADV_MIN_H, min(sh - 40, h))
+        ax = self.winfo_x() + self.winfo_width() + 10
+        if ax + w > sw - 10:                   # 右侧放不下就贴屏幕右缘
+            ax = max(10, sw - w - 12)
+        ay = max(10, min(self.winfo_y(), sh - h - 60))
+        self.advisor_win.geometry(f"{w}x{h}+{ax}+{ay}")
         self.advisor_win.deiconify()
         self.advisor_win.focus_force()
 
@@ -1420,6 +1580,12 @@ class GPUPanel(tk.Tk):
         """顾问窗口最大化 / 还原。"""
         if self._adv_saved_geo:
             self.advisor_win.geometry(self._adv_saved_geo)
+            try:
+                size = self._adv_saved_geo.split("+")[0]
+                w, h = size.split("x")
+                self.adv_w, self.adv_h = int(w), int(h)
+            except Exception:
+                pass
             self._adv_saved_geo = None
             lbl.config(text="□")
         else:
@@ -1458,10 +1624,12 @@ class GPUPanel(tk.Tk):
         dev_fr.pack(fill="x", padx=10, pady=(8, 0))
         tk.Label(dev_fr, text="🎯 推荐目标:", fg="#a0a0a0", bg=C_BG,
                  font=(FONT, 8)).pack(side="left")
-        dev_cb = ttk.Combobox(dev_fr, textvariable=tk.StringVar(
-            value=MA.DEVICE_LABELS.get(self.advisor_device, "本机")),
-            values=list(MA.DEVICE_LABELS.values()), state="readonly", width=24,
-            font=(FONT, 8))
+        # 必须持有 StringVar 引用，否则会被 GC，下拉框显示为空
+        self._adv_dev_var = tk.StringVar(
+            value=MA.DEVICE_LABELS.get(self.advisor_device, "本机"))
+        dev_cb = ttk.Combobox(dev_fr, textvariable=self._adv_dev_var,
+                              values=list(MA.DEVICE_LABELS.values()),
+                              state="readonly", width=24, font=(FONT, 8))
         dev_cb.pack(side="left", padx=6)
 
         def _on_device(event=None):
@@ -1483,9 +1651,15 @@ class GPUPanel(tk.Tk):
         # 标题: 所选设备配置摘要
         hdr = tk.Frame(self.a_frame, bg=C_CARD, padx=10, pady=8)
         hdr.pack(fill="x", padx=10, pady=(6, 4))
-        tk.Label(hdr, text=f"🖥️ {gpu_name} / {round(vram_mb / 1024)}GB 显存 / "
-                 f"{ram_mb//1024:.0f}GB 内存 / {cpu_cores}核 CPU",
-                 fg=C_FG, bg=C_CARD, font=(FONT, 9, "bold")).pack(anchor="w")
+        lbl_gpu = tk.Label(hdr, text=f"🖥️ {gpu_name}", fg=C_FG, bg=C_CARD,
+                           font=(FONT, 9, "bold"), anchor="w", justify="left")
+        lbl_gpu.pack(anchor="w", fill="x")
+        tk.Label(hdr, text=f"{round(vram_mb / 1024)}GB 显存 · "
+                           f"{ram_mb//1024:.0f}GB 内存 · {cpu_cores} 核 CPU",
+                 fg="#a0a0a0", bg=C_CARD, font=(FONT, 8)).pack(anchor="w")
+        # 长显卡名按窗口宽度换行，避免右侧被裁掉
+        hdr.bind("<Configure>",
+                 lambda e: lbl_gpu.config(wraplength=max(240, e.width - 24)))
         if config.get("note"):
             tk.Label(hdr, text=config["note"], fg="#a0a0a0", bg=C_CARD,
                      font=(FONT, 7)).pack(anchor="w")
@@ -1493,18 +1667,6 @@ class GPUPanel(tk.Tk):
         # 引擎计算
         advisor = MA.ModelAdvisor(vram_mb, ram_mb, cpu_cores)
         summary = advisor.recommend()
-
-        # 每个模型的推荐结果 (表格形式)
-        tk.Label(self.a_frame, text="📋 Qwen3 全系列推荐", fg=C_FG, bg=C_BG,
-                 font=(FONT, 9, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
-
-        # 创建表格头部（padx 与数据行各列一致，否则表头对不齐）
-        head_fr = tk.Frame(self.a_frame, bg=C_BG)
-        head_fr.pack(fill="x", padx=10)
-        for h, px in zip(("模型", "量化", "上下文", "显存", "状态"),
-                         (2, 12, 12, 12, 8)):
-            tk.Label(head_fr, text=h, fg=C_SUB, bg=C_BG, font=(FONT, 8, "bold")).pack(
-                side="left", padx=px, anchor="w")
 
         # 按适应度排序 (从上到下越适合当前设备):
         #   Q4_K_M 甜点 > 更高质量量化 > 低量化; 同分时上下文长、显存吃得满的优先
@@ -1522,57 +1684,120 @@ class GPUPanel(tk.Tk):
             vram_use = min(rec["recommended_vram_mb"] / max(vram_mb, 1), 1.0)
             return (q * 100 + ctx_bonus * 20 + vram_use * 10, 0.0)
 
-        # 每行一个模型
-        for name, rec in sorted(summary.items(), key=_fit_key, reverse=True):
-            row = tk.Frame(self.a_frame, bg=C_CARD if rec['best_quant'] == 'Q4_K_M' else C_BG)
-            row.pack(fill="x", padx=10, pady=1)
+        items = sorted(summary.items(), key=_fit_key, reverse=True)
+        n_total = len(items)
+        n_ok = sum(1 for _, r in items if r["max_context_tokens"] > 0)
 
-            # 模型名
-            moe_tag = " [MoE]" if rec['is_moe'] else ""
-            bg_color = C_CARD if rec['best_quant'] == 'Q4_K_M' else C_BG
-            tk.Label(row, text=f"{name}{moe_tag}", fg=C_FG, bg=bg_color,
-                     font=(FONT, 8)).pack(side="left", padx=2)
+        # 工具条: 过滤 + 复制
+        bar = tk.Frame(self.a_frame, bg=C_BG)
+        bar.pack(fill="x", padx=10, pady=(4, 2))
+        tk.Label(bar, text=f"📋 推荐结果   可运行 {n_ok}/{n_total}", fg=C_FG,
+                 bg=C_BG, font=(FONT, 9, "bold")).pack(side="left")
 
-            # 量化
-            q_color = "#6fb1d9" if rec['best_quant'] in ("Q4_K_M", "Q5_K_M") else "#a0a0a0"
-            tk.Label(row, text=rec['best_quant'], fg=q_color, bg=bg_color,
-                     font=(FONT, 8, "bold")).pack(side="left", padx=12)
+        # 必须持有 BooleanVar 引用：局部变量被 GC 后勾选框会失效
+        self._adv_only_var = tk.BooleanVar(value=self._adv_feasible_only)
+        only_ok = self._adv_only_var
+
+        def _toggle_only():
+            self._adv_feasible_only = bool(only_ok.get())
+            self._render_advisor()
+
+        tk.Checkbutton(bar, text="只看能跑", variable=only_ok, command=_toggle_only,
+                       bg=C_BG, fg=C_SUB, selectcolor=C_CARD2,
+                       activebackground=C_BG, activeforeground=C_FG,
+                       font=(FONT, 8), bd=0, highlightthickness=0
+                       ).pack(side="right")
+        tk.Button(bar, text="复制", command=self._copy_advisor, bg=C_CARD,
+                  fg=C_SUB, activebackground=C_CARD2, activeforeground=C_FG,
+                  relief="flat", bd=0, font=(FONT, 7), cursor="hand2",
+                  padx=7, pady=1).pack(side="right", padx=(0, 8))
+
+        if self._adv_feasible_only:
+            items = [(n, r) for n, r in items if r["max_context_tokens"] > 0]
+
+        # 表格用 grid + 列权重: 窗口拉宽时各列按比例铺开，而不是只多出右侧空白
+        table = tk.Frame(self.a_frame, bg=C_BG)
+        table.pack(fill="x", padx=10, pady=(4, 2))
+        for c, wt in enumerate((5, 2, 2, 2, 2)):
+            table.grid_columnconfigure(c, weight=wt, uniform="adv")
+        for c, h in enumerate(("模型", "量化", "上下文", "显存", "状态")):
+            tk.Label(table, text=h, fg=C_SUB, bg=C_BG, font=(FONT, 8, "bold"),
+                     anchor="w").grid(row=0, column=c, sticky="ew", padx=(2, 6))
+
+        self._adv_rows = []
+        for r, (name, rec) in enumerate(items, start=1):
+            bg_color = C_CARD if rec["best_quant"] == "Q4_K_M" else C_BG
+            moe_tag = " [MoE]" if rec["is_moe"] else ""
 
             # 上下文长度 (转 K tokens)
-            ctx_k = rec['max_context_tokens'] / 1024 if rec['max_context_tokens'] > 0 else 0
+            ctx_k = rec["max_context_tokens"] / 1024 if rec["max_context_tokens"] > 0 else 0
             ctx_txt = f"{ctx_k:.0f}K" if ctx_k >= 1 else f"{rec['max_context_tokens']} tok"
-            tk.Label(row, text=ctx_txt, fg=C_FG, bg=bg_color,
-                     font=(FONT, 8)).pack(side="left", padx=12)
 
             # 显存 (GB)
-            vram_gb = rec['recommended_vram_mb'] / 1024
+            vram_gb = rec["recommended_vram_mb"] / 1024
             if vram_gb < 16:
                 vram_color = "#66bb6a"
             elif vram_gb < 22:
                 vram_color = "#ffa726"
             else:
                 vram_color = "#ef5350"
-            tk.Label(row, text=f"{vram_gb:.1f}GB", fg=vram_color, bg=bg_color,
-                     font=(FONT, 8, "bold")).pack(side="left", padx=12)
 
             # 状态指示器
-            if rec['max_context_tokens'] <= 0:
+            if rec["max_context_tokens"] <= 0:
                 status = "❌ 装不下"
-            elif rec['best_quant'] in ("Q4_K_M", "Q5_K_M"):
+            elif rec["best_quant"] in ("Q4_K_M", "Q5_K_M"):
                 status = "✅ 推荐"
-            elif rec['max_context_tokens'] < 4096:
+            elif rec["max_context_tokens"] < 4096:
                 status = "⚠️ 极限"
             else:
                 status = "ℹ️ 可用"
-            tk.Label(row, text=status, fg="#a0a0a0", bg=bg_color,
-                     font=(FONT, 7)).pack(side="left", padx=8)
+
+            q_color = "#6fb1d9" if rec["best_quant"] in ("Q4_K_M", "Q5_K_M") else "#a0a0a0"
+            cells = (
+                (f"{name}{moe_tag}", C_FG, (FONT, 8)),
+                (rec["best_quant"], q_color, (FONT, 8, "bold")),
+                (ctx_txt, C_FG, (FONT, 8)),
+                (f"{vram_gb:.1f}GB", vram_color, (FONT, 8, "bold")),
+                (status, "#a0a0a0", (FONT, 7)),
+            )
+            for c, (text, fg, font) in enumerate(cells):
+                tk.Label(table, text=text, fg=fg, bg=bg_color, font=font,
+                         anchor="w").grid(row=r, column=c, sticky="ew",
+                                          padx=(2, 6), pady=1)
+            self._adv_rows.append((f"{name}{moe_tag}", rec["best_quant"],
+                                   ctx_txt, f"{vram_gb:.1f}GB", status))
 
         # 底部说明
         note_fr = tk.Frame(self.a_frame, bg=C_BG, padx=10, pady=6)
         note_fr.pack(fill="x")
         tk.Label(note_fr, text="💡 Q4_K_M 为质量/速度平衡点 | MoE=混合专家模型 (激活参数少，推理快)\n"
                        "显存 = 权重 + KV Cache (默认上下文 128K tokens, KV 按 Q4 量化估算) | VRAM 充裕时推荐高质量量化",
-                 fg="#5c6370", bg=C_BG, font=(FONT, 7)).pack(anchor="w")
+                 fg="#5c6370", bg=C_BG, font=(FONT, 7), justify="left",
+                 wraplength=390).pack(anchor="w")
+
+        # 按内容实际需要算最小宽度：高 DPI 下字号更大，固定 460px 会把列截断
+        try:
+            self.update_idletasks()
+            need = self.a_frame.winfo_reqwidth() + 44
+            self._adv_min_w = max(
+                ADV_MIN_W, min(need, self.winfo_screenwidth() - 40))
+        except Exception:
+            pass
+
+    def _copy_advisor(self):
+        """把当前推荐表复制到剪贴板（制表符分隔，可直接粘进 Excel）。"""
+        rows = getattr(self, "_adv_rows", [])
+        if not rows:
+            return
+        txt = "\n".join(["模型\t量化\t上下文\t显存\t状态"] +
+                        ["\t".join(r) for r in rows])
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self.update_idletasks()
+            self.lbl_status.config(text="已复制 %d 条推荐到剪贴板" % len(rows))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 设置
 
@@ -1581,8 +1806,8 @@ class GPUPanel(tk.Tk):
         win.title("设置")
         win.configure(bg=C_BG)
         win.attributes("-topmost", True)
-        win.geometry("260x250+%d+%d" % (max(10, self.winfo_x() - 270),
-                                        self.winfo_y()))
+        win.geometry("288x342+%d+%d" % (max(10, self.winfo_x() - 298),
+                                        max(10, self.winfo_y())))
         tk.Label(win, text="刷新间隔", bg=C_BG, fg=C_SUB, font=(FONT, 8)).pack(
             anchor="w", padx=14, pady=(14, 2))
         v = tk.IntVar(value=int(self.collector.interval * 1000))
@@ -1601,10 +1826,18 @@ class GPUPanel(tk.Tk):
                      command=lambda x: self._set_alpha(float(x)))
         a.set(self.alpha)
         a.pack(fill="x", padx=14)
-        tk.Label(win, text="悬浮球 / 隐藏 / 退出：标题栏 ◎ — ✕\n"
-                           "全局热键 Ctrl+Alt+G，托盘图标右键菜单",
+        tk.Button(win, text="恢复默认面板尺寸", command=self._reset_size,
+                  bg=C_CARD, fg=C_SUB, activebackground=C_CARD2,
+                  activeforeground=C_FG, relief="flat", bd=0,
+                  font=(FONT, 8), cursor="hand2").pack(fill="x", padx=14,
+                                                       pady=(10, 0))
+        tk.Label(win, text="右下角 ◢ 可拖动缩放，双击恢复默认\n"
+                           "模型顾问同样支持右下角 / 右边缘 / 下边缘拖动\n"
+                           "悬浮球 / 隐藏 / 退出：标题栏 ◎ — ✕\n"
+                           "全局热键 Ctrl+Alt+G，托盘图标右键菜单\n"
+                           "v" + APP_VERSION,
                  bg=C_BG, fg="#5c6370", font=(FONT, 7), justify="left").pack(
-            anchor="w", padx=14, pady=(8, 0))
+            anchor="w", padx=14, pady=(8, 10))
 
     def _set_interval(self, sec: float):
         self.collector.interval = sec
@@ -1768,7 +2001,7 @@ class GPUPanel(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.proc_rows.clear()
         new_sel = None
-        for p in s.procs[:200]:
+        for p in self._sorted_procs(s.procs)[:200]:
             name = p.name
             short = name if len(name) <= 22 else name[:20] + "…"
             tag = "sys" if name.lower() in PROTECTED_NAMES else (
@@ -1820,6 +2053,16 @@ class GPUPanel(tk.Tk):
 
         if not s.gpus:
             self.lbl_pcount.config(text="GPU 进程 (%d) · 未检测到 GPU 数据" % len(s.procs))
+
+        # 底部状态条：显存占用 + 进程数 + 更新时间
+        g0 = s.gpus[0] if s.gpus else None
+        if g0 and g0.mem_total:
+            self.lbl_status.config(text="%s / %s · %d 进程 · %s" % (
+                hr_bytes(g0.mem_used), hr_bytes(g0.mem_total), len(s.procs),
+                time.strftime("%H:%M:%S")))
+        else:
+            self.lbl_status.config(text="%d 个 GPU 进程 · 更新 %s" % (
+                len(s.procs), time.strftime("%H:%M:%S")))
 
         self.spark.push(total_util)
 
